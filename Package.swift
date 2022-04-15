@@ -23,6 +23,7 @@ let package = Package(
             dependencies: []),
         .testTarget(
             name: "IffUtilsTests",
-            dependencies: ["IffUtils"]),
+            dependencies: ["IffUtils"],
+            resources: [.copy("./test_image.iff")]),
     ]
 )
