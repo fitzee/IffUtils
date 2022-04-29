@@ -1,39 +1,150 @@
 import CoreFoundation
 import CoreData
+import CIffUtils
+import CoreImage
+import SwiftUI
 
 public class IffUtils {
-    private struct IFFHeader {
-        var IFFType = UnsafeMutablePointer<CChar>.allocate(capacity: 4)
-        var IFFSize: CUnsignedLong
-        var IFFsubType = UnsafeMutablePointer<CChar>.allocate(capacity: 4)
-    }
-    
-    private struct BMHD {
-        var w, h: CUnsignedInt
-        var nPlanes: CChar
-        var masking: CChar
-        var compression: CChar
-        var padL: CChar
-        var transparentColor: CUnsignedInt
-        var xAspect, yAspect: CChar
-        var pageW, pageH: CInt
+    enum IffUtilsError: Error {
+        case invalidFile
+        case fileError
+        case unsupportedChunk
+        case corruptFile
     }
     
     public init() {}
     
-    public static func m2i(l: CLong) -> CLong {
-        return (((l & 0xff000000) >> 24) +
-                ((l & 0x00ff0000) >> 8) +
-                ((l & 0x0000ff00) << 8) +
-                ((l & 0x000000ff) << 24))
+    
+    /// Uncompresses a run-length encoded byte buffer and returns the converted array
+    ///
+    /// - Parameters:
+    ///     - byteData: A pointer to the data buffer ([UInt8]) that will be uncompressed.
+    public static func uncompressBuffer(byteData: UnsafeRawBufferPointer.SubSequence) -> [UInt8] {
+        var uncompedBuffer = [UInt8]()
+        let ptr =  UnsafeRawBufferPointer(rebasing: byteData)
+        var i: Int? = 0
+        
+        while let i2 = i, i2 < byteData.count {
+            let byte = byteFromBuffer(ptr, index: i!)
+            let n = Int16(Int8(bitPattern: byte))
+            
+            if n >= 0 && n <= 127 {
+                for _ in 0..<n+1 {
+                    i! += 1
+                    if(i! < byteData.count) {
+                        uncompedBuffer.append(byteFromBuffer(ptr, index: i!))
+                    }
+                }
+                
+                i! += 1
+                continue
+            }
+            
+            if n >= -127 && n <= -1 {
+                for _ in 0..<abs(n)+1 {
+                    uncompedBuffer.append(byteFromBuffer(ptr, index: i!+1))
+                }
+                
+                i! += 2
+                continue
+            }
+            
+            if n == -128 {
+                i! += 2
+                continue
+            }
+            
+        }
+        
+        return uncompedBuffer
+    }
+
+    
+    /// Converts a given buffer of bytes predicated by a defined BMHD struct from raster/planar format to a color-index format; the output
+    /// is an array of bytes representing a single line of the bitmap that has been converted
+    ///
+    /// - Parameters:
+    ///     - src: A pointer to the data buffer ([UInt8]) that will be converted.
+    ///     - bmhd: A BMHD struct defining the data buffer, i.e. width of bitmap, # of bitplanes etc.
+    static let maskTable: [UInt8] = [0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01]
+    static let bitTable: [UInt8] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80]
+
+    public static func convertPlanarLine(src: UnsafeRawBufferPointer, bmhd: BMHD) throws -> [UInt8] {
+        let width = UInt16(bigEndian: bmhd.w)
+        let planes = bmhd.nPlanes
+        let rowBytes = ((width + 15) >> 4) << 1;
+        var ptr: UnsafeRawBufferPointer
+        
+        // this array will hold the converted line
+        var p: [UInt8] = Array(repeating: 0, count: Int(width))
+        
+        for i in 0..<width {
+            ptr = src
+            for j in 0..<planes {
+                let v = byteFromBuffer(ptr, index: Int(i)>>3) & maskTable[Int(i) & 0x0007]
+                if v > 0 {
+                    p[Int(i)] |= bitTable[Int(j)]
+                }
+        
+                ptr = UnsafeRawBufferPointer(rebasing: ptr.dropFirst(Int(rowBytes)))
+            }
+        }
+ 
+        return p
     }
     
-    public static func m2i(n: CInt) -> CInt {
-        return (((n & 0xff00) >> 8) | ((n & 0x00ff) << 8))
+
+    /// Returns a single byte at a specific index within a given buffer
+    ///
+    /// - Parameters:
+    ///     - pointer: a pointer to a buffer
+    ///     - index: the position (offset) within the buffer where the byte will be retrieved.
+    private static func byteFromBuffer(_ pointer: UnsafeRawBufferPointer, index: Int) -> UInt8 {
+        precondition(index >= 0)
+        precondition(index <= pointer.count - MemoryLayout<UInt8>.size)
+
+        var value = UInt8()
+        withUnsafeMutableBytes(of: &value) { valuePtr in
+            valuePtr.copyBytes(from: UnsafeRawBufferPointer(start: pointer.baseAddress!.advanced(by: index),
+                                                            count: MemoryLayout<UInt8>.size))
+        }
+        return value
     }
     
-    public static func openIFF(fileURL: URL) -> [UInt8] {
+    
+    /// Returns a defined struct of type T from a sequence of bytes
+    ///
+    /// - Parameters:
+    ///     - ptr: A pointer to the sequence of bytes to coerce into the struct.
+    ///     - toStruct: an instance of T to contain the bytes.
+    private static func rawBytesToStruct<T>(ptr: UnsafeRawBufferPointer.SubSequence, toStruct: T) -> T {
+        precondition(ptr.count == MemoryLayout<T>.size)
+        
+        let _data = Data(bytes: UnsafeRawBufferPointer(rebasing: ptr).baseAddress!, count: ptr.count)
+        let t: T = _data.withUnsafeBytes { $0.load(as: T.self) }
+        return t
+    }
+    
+    
+    /// Returns an NSString from a Swift representation of a C-like character array that may, or may not be NULL terminated
+    ///
+    /// - Parameters:
+    ///     - charArray: A pointer to the character/byte array.
+    ///     - charArrayLen: The number of characters/bytes in the array that should be included in the new NSString
+    private static func charArrayToString<UInt8>(charArray: UInt8, charArrayLen: Int) -> NSString {
+        precondition(charArrayLen > 0)
+
+        return NSString(bytes: withUnsafeBytes(of: charArray) {
+            Array($0.bindMemory(to: UInt8.self))
+        }, length: charArrayLen, encoding: String.Encoding.ascii.rawValue) ?? ""
+    }
+    
+    
+    public static func processFile(fileURL: URL) throws -> CGImage? {
         var fileBuffer = [UInt8]()
+        var decompedBuffer = [UInt8]()
+        var palette = [UInt8]()
+        var cgImg: CGImage? = nil
         
         do {
             let data = try Data(contentsOf: fileURL)
@@ -41,9 +152,93 @@ public class IffUtils {
             data.copyBytes(to: &buf, count: data.count)
             fileBuffer = buf
         } catch {
-            // do something
+            throw IffUtilsError.invalidFile
         }
         
-        return fileBuffer
+        let headerSize = MemoryLayout<IFFHeader>.size
+        let chunkSize = MemoryLayout<ChunkDesc>.size
+        
+        // get the IFF header object
+        let header: IFFHeader = fileBuffer.withUnsafeBytes { $0.load(as: IFFHeader.self) }
+  
+        // we only care about bitmap files
+        let headerSubType = charArrayToString(charArray: header.subtype, charArrayLen: 4)
+        if headerSubType != "ILBM" && headerSubType != "PBM " {
+            throw IffUtilsError.invalidFile
+        }
+        
+        var moreChunks = true
+        var newOffset = headerSize
+        var bmhd: BMHD? = nil
+        
+        while(moreChunks) {
+            let offsetAndChunk = newOffset+chunkSize
+            let nextChunk = rawBytesToStruct(ptr: fileBuffer.withUnsafeBytes { $0[newOffset..<newOffset+chunkSize] }, toStruct: ChunkDesc())
+            let nextChunkSize = CUnsignedInt(bigEndian: nextChunk.chunkSize)
+            let nextChunkType = charArrayToString(charArray: nextChunk.chunkType, charArrayLen: 4)
+            
+            switch nextChunkType {
+            case "BMHD":
+                bmhd = rawBytesToStruct(ptr: fileBuffer.withUnsafeBytes { $0[offsetAndChunk..<offsetAndChunk+Int(nextChunkSize)] }, toStruct: BMHD())
+                
+            case "CMAP":
+                let paletteData = fileBuffer.withUnsafeBytes { $0[offsetAndChunk..<offsetAndChunk+Int(nextChunkSize)] }
+                palette.append(contentsOf: paletteData)
+    
+            case "BODY":
+                if bmhd != nil {
+                    let width = UInt16(bigEndian: bmhd!.w)
+                    let height = UInt16(bigEndian: bmhd!.h)
+                    let rowBytes = ((width + 15) >> 4) << 1;
+                    
+                    // create a "view" over the image data
+                    let imageData = fileBuffer.withUnsafeBytes { $0[offsetAndChunk..<offsetAndChunk+Int(nextChunkSize)] }
+                    
+                    if(bmhd?.compression == 1) {
+                        decompedBuffer = uncompressBuffer(byteData: imageData)
+                    } else {
+                        decompedBuffer.append(contentsOf: UnsafeRawBufferPointer(rebasing: imageData))
+                    }
+                    
+                    var decompPtr = decompedBuffer.withUnsafeBytes { $0[...] }
+                    
+                    // store the unpacked IFF image data here
+                    var byteArray: [UInt8] = [UInt8]()
+                    let offset = Int(rowBytes)*Int(bmhd!.nPlanes)
+                    
+                    for _ in 0..<height {
+                        byteArray.append(contentsOf: try convertPlanarLine(src: UnsafeRawBufferPointer(rebasing: decompPtr), bmhd: bmhd!))
+                        decompPtr = decompPtr.withUnsafeBytes { $0[offset...] }
+                    }
+                    
+                    let dp = CGDataProvider(data: CFDataCreate(kCFAllocatorDefault, byteArray, byteArray.count))
+                    let indexedColorSpace = CGColorSpace(indexedBaseSpace: CGColorSpaceCreateDeviceRGB(), last: palette.count / 3 - 1, colorTable: palette)!
+                    let bmpinfo = CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder16Little.rawValue)
+                    
+                    cgImg = CGImage(width: Int(width), height: Int(height), bitsPerComponent: 8, bitsPerPixel: 8, bytesPerRow: Int(width), space: indexedColorSpace, bitmapInfo: bmpinfo, provider: dp!, decode: nil, shouldInterpolate: false, intent: CGColorRenderingIntent.defaultIntent)
+                    
+                    print(cgImg.debugDescription)
+                }
+                
+            case "CRNG", "CAMG", "GRAB", "DPPS", "ANNO", "DPI ":
+                break
+            
+            default:
+                throw IffUtilsError.unsupportedChunk
+            }
+            
+            newOffset += (chunkSize + Int(nextChunkSize))
+            if (newOffset % 2) == 1 {   // check for unpadded file
+                newOffset += 1
+            }
+            
+            if newOffset == fileBuffer.count {
+                moreChunks = false      // at the end of the file, so let's get out of here
+            }
+        }
+        
+        return cgImg
     }
+    
+    
 }
