@@ -61,7 +61,7 @@ public class IffUtils {
     }
 
     
-    /// Converts a given buffer of bytes predicated by a defined BMHD struct from raster/planar format to a either a  color-index format or an RGB value;
+    /// Converts a given buffer of bytes predicated by a defined BMHD struct from raster/planar format to a either a color-index format or an RGB value;
     /// the output is an array of bytes representing a single line of the bitmap that has been converted
     ///
     /// - Parameters:
@@ -72,33 +72,33 @@ public class IffUtils {
 
     public static func convertPlanarLine(src: UnsafeRawBufferPointer, bmhd: BMHD) throws -> [UInt8] {
         let width = UInt16(bigEndian: bmhd.w)
-        let planes = bmhd.nPlanes
-        let rowBytes = ((width + 15) >> 4) << 1;
+        let planes = UInt16(bmhd.nPlanes)
+        let bytesPerRow = ((width + 15) >> 4) << 1;
         var ptr: UnsafeRawBufferPointer
         
-        // if the image is 24bits, each line is 3 times as big (1 byte for each color component)
-        let multiplier = planes > 8 ? 3 : 1
+        // if the image is 24bits (or 32), each line is 3 (or 4) times as big - i.e. 1 byte for each color component
+        let bytesPerPixel = planes > 8 ? Int(planes>>3) : Int(1)
         
         // this array will hold the converted line
-        var p: [UInt8] = Array(repeating: 0, count: Int(width)*Int(multiplier))
-        var idx: UInt16 = 0
-        var p2 = 0
+        var p: [UInt8] = Array(repeating: 0, count: Int(width)*Int(bytesPerPixel))
+        var bitIdx: UInt16 = 0          // represents the index within bitTable
+        var compIdx = 0                 // the component index (e.g. R, G, or B)
         
-        for i in 0..<width {
+        for horPos in 0..<width {
             ptr = src
-            p2 = Int(((Int(i)+1)*multiplier)-multiplier)
+            compIdx = ((Int(horPos)+1)*bytesPerPixel)-bytesPerPixel
 
-            for j in 0..<planes {
-                let v = byteFromBuffer(ptr, index: Int(i)>>3) & maskTable[Int(i) & 0x0007]
+            for curPlane in 0..<planes {
+                let _byte = byteFromBuffer(ptr, index: Int(horPos)>>3) & maskTable[Int(horPos) & 0x0007]
                 // reset the bitTable index for 24bit images every 8 bits!
-                idx = UInt16(((j << 1) & 0x000F) >> 1)
-                if v > 0 {
-                    p[p2] |= bitTable[Int(idx)]
+                bitIdx = ((curPlane << 1) & 0x000F) >> 1
+                if _byte > 0 {
+                    p[compIdx] |= bitTable[Int(bitIdx)]
                 }
 
-                p2 = idx == 7 ? p2+1 : p2
+                compIdx = bitIdx == 7 ? compIdx+1 : compIdx
 
-                ptr = UnsafeRawBufferPointer(rebasing: ptr.dropFirst(Int(rowBytes)))
+                ptr = UnsafeRawBufferPointer(rebasing: ptr.dropFirst(Int(bytesPerRow)))
             }
         }
  
@@ -226,18 +226,16 @@ public class IffUtils {
                 }
                 
   
+                // setup the bits we need to create a CGImage - it's mostly the same whether it's a "deep" or normal color-indexed ILBM (except for the colorSpace)
                 let dp = CGDataProvider(data: CFDataCreate(kCFAllocatorDefault, byteArray, byteArray.count))
                 let bmpinfo = CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder16Little.rawValue)
                 let indexedColorSpace = nPlanes <= 8 ? CGColorSpace(indexedBaseSpace: CGColorSpaceCreateDeviceRGB(), last: palette.count / 3 - 1, colorTable: palette)! : CGColorSpaceCreateDeviceRGB()
                 
-                if nPlanes <= 8 {
-                    cgImg = CGImage(width: Int(width), height: Int(height), bitsPerComponent: 8, bitsPerPixel: 8, bytesPerRow: Int(width), space: indexedColorSpace, bitmapInfo: bmpinfo, provider: dp!, decode: nil, shouldInterpolate: false, intent: CGColorRenderingIntent.defaultIntent)
-                } else {
-                    cgImg = CGImage(width: Int(width), height: Int(height), bitsPerComponent: 8, bitsPerPixel: 24, bytesPerRow: Int(width)*3, space: indexedColorSpace, bitmapInfo: bmpinfo, provider: dp!, decode: nil, shouldInterpolate: false, intent: CGColorRenderingIntent.defaultIntent)
-                }
-                
+                cgImg = CGImage(width: Int(width), height: Int(height), bitsPerComponent: 8, bitsPerPixel: (nPlanes > 8 ? Int(nPlanes) : 8), bytesPerRow: Int(width)*(nPlanes > 8 ? Int(nPlanes>>3) : Int(1)), space: indexedColorSpace, bitmapInfo: bmpinfo, provider: dp!, decode: nil, shouldInterpolate: false, intent: CGColorRenderingIntent.defaultIntent)
+
                 print(cgImg.debugDescription)
                 
+            // not supporting these chunk types right now
             case "CRNG", "CAMG", "GRAB", "DPPS", "ANNO", "DPI ":
                 break
             
